@@ -1,5 +1,7 @@
 # LangGraph Chatbot with Short-Term and Long-Term Memory
 
+![Chatbot UI](assets/chatbot.png)
+
 A chatbot built with LangGraph and Streamlit. It uses Groq-hosted models for the replies and PostgreSQL for conversation state, titles, long-term memories, and LTM processing metadata. It has two kinds of memory:
 
 - Short-term memory (STM): a running summary of the current conversation, so older messages don't have to stay in the prompt.
