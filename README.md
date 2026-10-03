@@ -251,42 +251,62 @@ The `POSTGRES_URI` in the example matches the values in `docker-compose.yml`. If
 
 ## Evaluation
 
-The `evaluation/` folder tests the LTM pipeline one stage at a time (extraction, retrieval, resolution) and then runs the whole pipeline on a set of conversations. Everything is small and hand-written, roughly twenty cases per test, and the extraction conversations come from my own chats while building this project. I used it to find where the pipeline breaks, not to estimate how it would do on real users, so there are no accuracy numbers here. Only the STM summarization, multi-thread handling, background processing and the memory UI are not covered by any of these tests.
+The `evaluation/` folder evaluates the long-term memory system at both the component and end-to-end levels.
 
-**What was tested**
+It includes separate tests for **memory extraction, retrieval, and resolution**, along with end-to-end cases that check how the complete pipeline updates the stored memory state.
 
-- **Extraction, explicit requests** (`Extraction/remember`): single messages like "Remember that I prefer PyTorch over TensorFlow" across preferences, goals, projects and facts, plus task-style reminders ("Remember to explain attention later") that should not be stored.
-- **Extraction, normal conversations** (`Extraction/10_Message`): short conversations of user messages taken from my own chat history. Some contain something worth remembering and many are just Q&A. These were checked by reading the output against my expected memories.
-- **Resolver** (`Resolver`): a candidate memory plus a hand-picked list of existing memories is passed straight to the resolver, and the decision (`ADD`/`UPDATE`/`DELETE`/`NOOP`) and target id are compared to what I expected. Retrieval is bypassed.
-- **Retrieval for resolution** (`Resolution_retrieval`): about 30 seeded memories, with candidate memories as queries, checking whether the related memory shows up in the top 5.
-- **Retrieval for chat** (`Chat_memory_retrieval`): a separate set of generic personal memories (tea, travel, guitar) and queries that don't repeat the memory's wording, split into clear, borderline and unrelated queries, then a sweep over similarity thresholds.
-- **End-to-end** (`E2E_LTM`): the full pipeline on multi-message conversations and on "remember" messages, against 15 seeded memories, comparing the operation and target id. Decisions are not written to the database in this test.
+The evaluation cases are hand-written, with a focus on realistic conversations and edge cases rather than benchmark-scale data. The results are used to identify where the memory system works reliably and where it can make incorrect additions, updates, deletions, or no-op decisions.
 
-**Extraction**
+### Memory Extraction
 
-Explicit "remember" messages were extracted correctly in content, and the task-style reminders ("Remember to show me the code later") produced no memory. The problems are small. The type is sometimes wrong: "I usually code using Python 3.10" was stored as a preference when I expected a fact. The wording is also not consistent. The stored text is usually a paraphrase of the message, often in a "User's project is..." or "User's goal is..." template, so it doesn't match what I'd write by hand. That doesn't matter much for a single memory, but it affects later matching and resolution, since the same fact can be worded differently each time it comes up.
+I tested extraction in two situations: explicit `remember` requests and normal 10-message conversations.
 
-On normal conversations, goals, facts and standing instructions were usually picked up (my name, laptop GPU, "always explain in detail", "don't give whole code"). Conversations that were only questions produced nothing, including ones about things I was learning. When it was wrong, it missed things rather than inventing them: "I'm thinking of building a RAG system for legal documents" was not stored, and in another conversation it kept the FastAPI preference but ignored that I'd built a LangGraph chatbot. Stored memories sometimes got extra detail or a different type (a finished BERT implementation became a fact with "took longer than expected" attached). Some of my expected lists are judgement calls too.
+For explicit requests, I used 25 cases covering preferences, goals, projects, facts, and requests that should not be stored. The extractor got the intended memory in the cases where a memory was expected and correctly returned nothing for temporary requests such as remembering to explain something later. One notable error was classifying *“I usually code using Python 3.10”* as a preference instead of a fact. Since type is not used downstream, this does not affect the pipeline.
 
-**Resolver**
+The 10-message cases were less consistent. It handled straightforward cases such as the user's goal, existing projects, and hardware, but missed some information that was spread across the conversation. For example, it missed an existing LangGraph project in one conversation and a new legal-document RAG project in another.
 
-New memories that are close to existing ones but not the same (learning Docker when a Docker-in-chatbot memory exists, deployment skills) were added instead of merged. Paraphrased duplicates gave `NOOP`, conflicting facts gave `UPDATE` (SQLite vs PostgreSQL, PyTorch vs TensorFlow, a name correction, "Punjab" refining "India"), and "stopped", "cancelled" and "no longer" candidates gave `DELETE`. The one miss was "looking for an AI engineering job instead of an internship": I expected `UPDATE` of the internship memory and it deleted it. That case is arguably ambiguous, since a separate "wants an AI engineering job" memory also existed.
+The main issue from these tests is that extraction is much easier when the user states something directly than when the information has to be picked out of a longer conversation.
 
-**Retrieval**
+### Retrieval for Resolution
 
-For resolution, the related memory was in the top 5 for every candidate that had one, including reworded ones ("reasons before coding" vs "reasons before implementation"). But search always returns five, so the candidate with no related memory ("learning computer vision") still got five unrelated results. Retrieval alone says nothing about whether something is related, and the resolver has to handle that.
+The retrieval tests check whether relevant existing memories can be found for a new memory candidate. Across the test cases, relevant memories were consistently retrieved in the top results (`Recall@5 = 1.0`). An unrelated query also returned results, since the retriever ranks the closest memories rather than deciding whether a relevant memory exists.
 
-For chat retrieval, queries that mention the topic directly (guitar, digital marketing, sleep schedule) found the right memory first. Indirect ones were weaker: "what to order for dinner" matched a memory about cooking dinner at home before the seafood restriction, and "start exercising" ranked strength training above running. The threshold sweep showed a trade-off. With a very low threshold unrelated queries still got memories back, and raising it removed those but started dropping the indirect cases first. No value did both cleanly, so the threshold I use (`<threshold>`) is a compromise. The closest false matches were loosely overlapping ones, such as an exam-study question matching the master's degree memory.
+### Memory Resolution
 
-**End-to-end**
+The resolution stage was evaluated using 20 hand-written cases covering the four possible decisions: `ADD`, `NOOP`, `UPDATE`, and `DELETE`.
 
-The explicit "remember" cases all behaved as expected: new memories were added, changed facts updated, restatements ignored, "no longer" statements deleted, and messages using "remember" in another sense ("do you remember the bug we fixed yesterday") stored nothing. These are single messages worded close to the stored memories, so they're the easy case.
+The cases cover common situations such as adding completely new information, recognizing semantically equivalent memories, replacing outdated information with a newer value, and removing memories that are no longer valid. The resolver correctly handled all 20 cases.
 
-Automatic extraction from conversations also mostly worked. Chit-chat and passing preferences stored nothing, and updates and no-ops landed on the right existing memory. Retrieval wasn't the bottleneck: the target memory was always in the retrieved set, usually first.
+For `NOOP`, the tests include both exact matches and differently worded memories with the same meaning. The `UPDATE` cases cover changes to existing facts, preferences, and goals, while the `DELETE` cases test situations where previously stored information is explicitly no longer true.
 
-The failures came from extraction wording feeding the resolver. Where I dropped a topic without saying "no longer" ("I've dropped that thing", "I got what I needed from both for now"), the extractor rewrote it as a negative preference ("User prefers not to continue learning langchain or langgraph"), and the resolver then chose `UPDATE` instead of `DELETE`. The resolver handled deletion well when the candidate said "stopped" or "no longer", so the component test hid this: it uses clean hand-written candidates, all typed as `fact`, while the real extractor produces its own phrasing and labels many of these as preferences. A third mismatch was the Kubernetes/devops conversation, where "I'm not trying to go into devops" was stored as a preference and the deployment goal kept first-person wording ("deploy my own apps"). I wouldn't count that one as a clean failure because of the expected `NOOP` noted above.
+These cases are intentionally clear rather than highly ambiguous. They verify that the resolver can reliably distinguish the four actions under well-defined conditions. More ambiguous situations, such as deciding between `ADD` and `UPDATE` when information is only partially related, are not covered by this small evaluation set.
 
-**Limitations**
+### End-to-End Evaluation
 
-Each case was run once and LLM output varies, so any single result can change. The seeded memory sets are small, which makes retrieval easier than it would be with a long-lived user. The E2E test only checks decisions, not what gets written to the database or how the memory UI shows it.
+The end-to-end evaluation covers both **automatic cases** from normal conversations and **explicit `remember` requests**.
 
+The **automatic cases** handled most clear situations correctly: temporary conversations were ignored, new preferences and goals were added, changed information was updated, outdated memories were removed, and existing information returned `NOOP`.
+
+There were three failures. In **case 007**, the deployment goal was correctly added, but the statement about not going into DevOps was stored as a new memory instead of `NOOP`. In **cases 014 and 015**, the user stopped learning LangChain/LangGraph and LLM evaluation respectively. The extractor and retrieval worked correctly, but the resolver chose `UPDATE` instead of `DELETE`. This shows that the resolver can still **confuse `DELETE` and `UPDATE`, especially when the user is dropping or stopping something**.
+
+The **explicit cases all behaved as expected**, including `ADD`, `UPDATE`, `NOOP`, and `DELETE`, while temporary or non-memory requests were ignored.
+
+The evaluation is based on a small set of hand-written scenarios, so it mainly tests clear cases and does not cover many ambiguous situations.
+
+### Chat Memory Retrieval
+
+The retriever was tested with positive, borderline, and negative queries. It retrieved the expected memory in most positive cases, while some borderline cases did not retrieve all expected memories. Negative queries could also return weakly similar memories, since the retriever returns the closest matches.
+
+A **0.20 similarity threshold** was used for the chatbot. On this small evaluation, it gave **93.8% positive recall** and a **28.6% negative false-positive rate**. These results are not enough to consider 0.20 an optimal threshold. Also, retrieving an irrelevant memory does not mean it will be used by the chatbot; memories are only used when they are relevant to the current message.
+
+## Limitations
+
+- **LLM-based memory decisions can be wrong.** Extraction and resolution depend on the LLM, so ambiguous conversations can still lead to incorrect memories or actions.
+
+- **`DELETE` vs `UPDATE` can be confused.** The end-to-end evaluation showed failures where the user clearly stopped or dropped something, but the resolver chose `UPDATE` instead of `DELETE`.
+
+- **The evaluation is small and hand-written.** It covers common and relatively clear cases, so it is not enough to claim general performance or an optimal retrieval threshold.
+
+- **No authentication.** Users are identified by a browser-generated UUID, so there is no real account system or cross-device identity.
+
+- **LTM processing is asynchronous.** Memory extraction and updates happen in the background, so newly created or changed memories may not be available immediately.
